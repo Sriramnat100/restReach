@@ -13,4 +13,5 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 - Read `docs/SPEC.md`, `docs/ARCHITECTURE.md` and `docs/ROADMAP.md` before changing code. Only build the milestone you were asked to build.
 - The tenant-isolation, authorization and Row Level Security rules in `docs/ARCHITECTURE.md` (sections 3, 6 and 7) are mandatory.
 - Don't add dependencies or abstractions without a concrete, current need.
-- Run `npm run lint` and `npm run typecheck` before committing.
+- Database changes go in a new file in `supabase/migrations/` (never edit an applied migration), with pgTAP tests in `supabase/tests/` for every new table or policy. Then run `npm run db:reset`, `npm run db:test` and `npm run db:types`.
+- Run `npm run lint`, `npm run typecheck` and `npm run db:test` before committing.

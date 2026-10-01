@@ -1,8 +1,8 @@
 # restReach Architecture
 
-**Status:** proposal for review (Milestone 0) · **Last updated:** 2026-10-01
+**Status:** design approved; Milestone 1 (database) built · **Last updated:** 2026-10-01
 
-Only the scaffold and folder layout (§2) exist today. Everything else describes the design we'll build once it's approved. As each milestone lands, this document is updated to match the code.
+Built so far: the scaffold (§2) and the database with its security rules and tests (§4, §7, §12). Everything else describes the approved design for later milestones. As each milestone lands, this document is updated to match the code.
 
 Read [SPEC.md](./SPEC.md) first for what we're building and why. [ROADMAP.md](./ROADMAP.md) has the build order.
 
@@ -22,7 +22,7 @@ Read [SPEC.md](./SPEC.md) first for what we're building and why. [ROADMAP.md](./
 12. [Testing strategy](#12-testing-strategy)
 13. [Future: custom domains](#13-future-custom-domains)
 14. [Future: lead intelligence integration](#14-future-lead-intelligence-integration)
-15. [Decisions pending review](#15-decisions-pending-review)
+15. [Decisions](#15-decisions)
 
 ---
 
@@ -87,10 +87,14 @@ lib/
   auth/                     who is signed in: getCurrentUser, requireUser
   permissions/              what they may access: requireAdmin, requireBusinessAccess, ...
   tenant/                   which business a public request is for (slug today, hostname later)
-  db/                       data access: every query and mutation, plus generated DB types
+  db/                       data access: every query and mutation (M2+); database.types.ts is generated from the schema
   validation/               Zod schemas for every mutation's input
 supabase/
+  config.toml               local Supabase settings (unused services turned off)
   migrations/               SQL migrations: the only way the schema changes
+  tests/                    pgTAP database tests: RLS and tenant isolation
+  seed.sql                  local development data: sample restaurants and dev logins
+.github/workflows/ci.yml    CI: lint, typecheck, database tests
 docs/                       SPEC, ARCHITECTURE, ROADMAP
 proxy.ts                    Next.js proxy (formerly middleware.ts): session refresh (M2)
 ```
@@ -129,7 +133,7 @@ Layer 3 is essential, not optional. The Supabase publishable key is public by de
 
 ## 4. Database design
 
-This is a proposal. Once approved, it becomes the first migration in `supabase/migrations/`.
+The schema lives in [`supabase/migrations/20261001215117_initial_schema.sql`](../supabase/migrations/20261001215117_initial_schema.sql), which is commented throughout. This section explains it.
 
 ### Conventions
 
@@ -169,120 +173,16 @@ platform_admins                                   businesses
 | `business_links` | Instagram, Facebook, online ordering and reservation URLs |
 | `business_images` | Metadata for images stored in Supabase Storage |
 
-### Proposed SQL
+### What's in the migration
 
-Tables and integrity constraints only. The helper functions and policies are in §7. The `updated_at` and admin-only-column triggers are described below the SQL.
-
-```sql
--- Platform-wide ADMIN role. Rows are added by hand with SQL; no API or UI can grant it.
-create table public.platform_admins (
-  user_id    uuid primary key references auth.users (id) on delete cascade,
-  created_at timestamptz not null default now()
-);
-
--- Tenants.
-create table public.businesses (
-  id             uuid primary key default gen_random_uuid(),
-  slug           text not null unique
-                   check (slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$' and char_length(slug) <= 63),
-  name           text not null check (char_length(name) between 1 and 120),
-  description    text,
-  phone          text,
-  address_line_1 text,
-  address_line_2 text,
-  city           text,
-  state          text,
-  zip_code       text,
-  template       text not null default 'classic' check (template in ('classic')),
-  is_published   boolean not null default false,
-  created_at     timestamptz not null default now(),
-  updated_at     timestamptz not null default now()
-);
-
--- Which users can manage which business.
-create table public.memberships (
-  id          uuid primary key default gen_random_uuid(),
-  user_id     uuid not null references auth.users (id) on delete cascade,
-  business_id uuid not null references public.businesses (id) on delete cascade,
-  role        text not null default 'owner' check (role in ('owner')),
-  created_at  timestamptz not null default now(),
-  unique (user_id, business_id)
-);
-create index on public.memberships (business_id);
-
--- Weekly hours as open periods. A day with no rows is closed.
--- day_of_week: 0 = Sunday ... 6 = Saturday.
--- closes_at earlier than opens_at means the period ends after midnight (18:00-02:00).
-create table public.business_hours (
-  id          uuid primary key default gen_random_uuid(),
-  business_id uuid not null references public.businesses (id) on delete cascade,
-  day_of_week smallint not null check (day_of_week between 0 and 6),
-  opens_at    time not null,
-  closes_at   time not null,
-  check (closes_at <> opens_at),
-  unique (business_id, day_of_week, opens_at)
-);
-
-create table public.menu_categories (
-  id            uuid primary key default gen_random_uuid(),
-  business_id   uuid not null references public.businesses (id) on delete cascade,
-  name          text not null check (char_length(name) between 1 and 80),
-  display_order integer not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  unique (id, business_id)  -- target of the composite foreign key in menu_items
-);
-create index on public.menu_categories (business_id, display_order);
-
-create table public.menu_items (
-  id            uuid primary key default gen_random_uuid(),
-  business_id   uuid not null references public.businesses (id) on delete cascade,
-  category_id   uuid not null,
-  name          text not null check (char_length(name) between 1 and 120),
-  description   text,
-  price_cents   integer check (price_cents >= 0),  -- null = no price shown
-  is_available  boolean not null default true,
-  display_order integer not null default 0,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now(),
-  -- The item's category must belong to the item's business.
-  foreign key (category_id, business_id)
-    references public.menu_categories (id, business_id) on delete cascade
-);
-create index on public.menu_items (business_id);
-create index on public.menu_items (category_id, display_order);
-
--- At most one URL per kind per business.
-create table public.business_links (
-  id          uuid primary key default gen_random_uuid(),
-  business_id uuid not null references public.businesses (id) on delete cascade,
-  kind        text not null
-                check (kind in ('instagram', 'facebook', 'ordering', 'reservations')),
-  url         text not null check (url ~* '^https?://'),
-  created_at  timestamptz not null default now(),
-  updated_at  timestamptz not null default now(),
-  unique (business_id, kind)
-);
-
--- Image metadata. The files live in the 'business-images' Storage bucket.
-create table public.business_images (
-  id            uuid primary key default gen_random_uuid(),
-  business_id   uuid not null references public.businesses (id) on delete cascade,
-  storage_path  text not null unique,  -- '<business_id>/<random uuid>.<ext>'
-  alt_text      text,
-  placement     text not null default 'gallery' check (placement in ('hero', 'gallery')),
-  display_order integer not null default 0,
-  created_at    timestamptz not null default now(),
-  check (starts_with(storage_path, business_id::text || '/'))
-);
-create index on public.business_images (business_id, display_order);
-```
-
-The same migration also adds:
+Besides the tables and their constraints, the migration contains:
 
 - an `updated_at` trigger on every table that has the column;
-- the `private` schema with the RLS helper functions (§7), plus RLS enabled and policies on every table;
-- a `before update` trigger on `businesses` that rejects changes to `slug`, `template` or `is_published` unless the caller is an admin.
+- the `private` schema with the RLS helper functions, RLS enabled on every table, and the policies (§7);
+- a `before update` trigger on `businesses` that rejects changes to `slug`, `template` or `is_published` unless the caller is an admin;
+- four functions for edits that touch many rows and must be atomic: `replace_business_hours`, `reorder_menu_categories`, `reorder_menu_items` and `reorder_business_images`. They run with the caller's permissions, so RLS still applies. They also check access up front, so an unauthorized call fails loudly instead of silently changing nothing.
+
+**Changing the schema** always means adding a new migration (`npx supabase migration new <name>`), never editing one that has been applied. Then run `npm run db:reset`, `npm run db:test` and `npm run db:types`.
 
 ### Design notes
 
@@ -428,22 +328,26 @@ Policies call three small SQL functions in a `private` schema, which isn't expos
 | `platform_admins` | none | read only their own row, if any (this is how the app checks admin status) | read only their own row. Rows are added and removed with SQL only |
 | Storage bucket `business-images` | read (public bucket) | upload, replace and delete inside their business's folder | everything |
 
-Creating and deleting businesses is admin-only. Every tenant content table follows the same pattern:
+Creating and deleting businesses is admin-only. Every tenant content table follows the same pattern, shown here for `menu_items`:
 
 ```sql
-alter table public.menu_items enable row level security;
-
-create policy "Anyone can read menu items of published businesses"
-  on public.menu_items for select to anon, authenticated
+create policy "Anonymous visitors can read menu items of published businesses"
+  on public.menu_items for select to anon
   using (private.is_published_business(business_id));
 
-create policy "Members and admins can manage menu items"
-  on public.menu_items for all to authenticated
+create policy "Users can read menu items of published businesses and businesses they manage"
+  on public.menu_items for select to authenticated
+  using (private.is_published_business(business_id) or private.can_manage_business(business_id));
+
+create policy "Members and admins can update menu items"
+  on public.menu_items for update to authenticated
   using (private.can_manage_business(business_id))
   with check (private.can_manage_business(business_id));
+
+-- ...plus matching insert and delete policies.
 ```
 
-`with check` also stops anyone from moving a row into a business they don't belong to.
+Each table has exactly one policy per role and action. That keeps the rules easy to audit, and Postgres never has to combine overlapping policies. `with check` also stops anyone from moving a row into a business they don't belong to.
 
 ### What RLS can't express, and how we cover it
 
@@ -526,19 +430,23 @@ Route: `app/sites/[slug]/page.tsx`, a Server Component.
 
 | Layer | Tool | Covers |
 |---|---|---|
-| Database | pgTAP, run by `supabase test db` against the local Supabase stack (Docker) | RLS policies, triggers and constraints, exercised as anonymous, owner A, owner B and admin |
+| Database (built) | pgTAP files in `supabase/tests/`, run by `npm run db:test` against the local Supabase stack (Docker) | RLS policies, triggers, constraints and the edit functions, exercised as anonymous, a signed-in outsider, owner A, owner B and admin |
 | End to end | Playwright against the local app and local Supabase, with seed data | Route protection, cross-tenant URLs, edit → public site |
 | Unit | Vitest, only if enough pure logic appears (e.g. hours formatting) | Added only when there's something worth testing |
 
-**Seed data** (`supabase/seed.sql`): two businesses, A ("Joe's Pizza") and B ("Thai Garden"), one owner for each, one admin, and sample hours, menu and links.
+**Database tests.** Each test file creates its own users and businesses inside a transaction and rolls it back, so tests never depend on or change the seed data. `tenant_isolation.test.sql` checks what every kind of user can read and write in every table. It also fails if any table in `public` lacks RLS, which guards future migrations. `business_rules.test.sql` covers the admin-only fields, the edit functions and the data constraints.
+
+**Prove a new test can fail.** When adding or changing a policy, break it on purpose in the local database and check that a test goes red, then run `npm run db:reset`. We did this for Milestone 1: four deliberately broken rules (an over-broad read policy, RLS disabled on a table, the admin-fields trigger removed, an open update policy) each made tests fail.
+
+**Seed data** (`supabase/seed.sql`, local only): Joe's Pizza and Thai Garden (published, split lunch/dinner hours at Thai Garden), Pasta House (an unpublished draft owned by Thai Garden's owner), sample menus and links, and three dev logins listed at the top of the file.
 
 | # | Requirement | How it's tested |
 |---|---|---|
 | 1 | Unauthenticated users can't access `/dashboard` | E2E: redirected to `/login` |
 | 2 | Unauthenticated users can't access `/admin` | E2E: redirected to `/login` |
 | 3 | OWNER can't access `/admin` | E2E: 404, and admin actions are rejected |
-| 4 | Owner of A can't access B | DB: for every tenant table, owner A can't read B's unpublished data, can't write any of B's rows, can't move rows into B, and can't reference B's rows. E2E: `/dashboard/<B's id>/…` returns 404 |
-| 5 | ADMIN can access all businesses | DB and E2E |
+| 4 | Owner of A can't access B | DB (built): for every tenant table, owner A can't read B's unpublished data, can't write any of B's rows, can't move rows into B, and can't reference B's rows. E2E: `/dashboard/<B's id>/…` returns 404 |
+| 5 | ADMIN can access all businesses | DB (built) and E2E |
 | 6 | Restaurant updates persist correctly | E2E: edit in the dashboard, reload, the value is still there |
 | 7 | Public site shows current database values | E2E: change a value, reload `/sites/<slug>`, see it. An unpublished business returns 404 |
 
@@ -546,7 +454,8 @@ Additional database tests:
 
 - Anonymous users read only published content, and never `memberships` or `platform_admins`.
 - Owners can't change slug, template or published status, can't create memberships, and can't grant themselves admin.
-- Storage writes outside a user's own business folder fail.
+- Removing a membership revokes access immediately.
+- Storage writes outside a user's own business folder fail (added with Storage in Milestone 6).
 
 ## 13. Future: custom domains
 
@@ -570,16 +479,16 @@ That's why tenant resolution lives in `lib/tenant`: today it maps a slug to a bu
 - **Admin-only visibility.** If lead data appears in `/admin`, it's read through admin-only policies, or with the secret key behind `requireAdmin()`. Owners and anonymous visitors can never reach it.
 - Adding this system won't require changes to the current design. The one rule today: **don't add prospect or lead fields to the platform's tables.**
 
-## 15. Decisions pending review
+## 15. Decisions
 
-These are proposals, not settled choices. Each one is easy to change before Milestone 1 and harder afterwards.
+Approved on 2026-10-01, except the login method, which is decided at the start of Milestone 2.
 
-| # | Decision | Proposal | Main alternative |
+| # | Decision | Chosen | Main alternative |
 |---|---|---|---|
 | 1 | Dashboard URLs | `/dashboard/[businessId]/menu`: supports owners with several restaurants and lets admins reuse the owner screens | `/dashboard/menu`, assuming one business per owner |
 | 2 | How ADMIN is stored | `platform_admins` table (platform-wide); `memberships.role` is `owner` only | ADMIN as a membership role, or a flag in Supabase Auth `app_metadata` |
 | 3 | Hours model | Several open periods per day; no rows means closed | One row per day with `open_time`, `close_time`, `closed` (can't represent lunch/dinner splits) |
 | 4 | Publishing | `is_published` flag; slug, template and publishing are admin-only | Owners publish their own sites |
-| 5 | Login method | Email and password, invite-only, sign-up disabled | Passwordless email links or codes |
-| 6 | Pricing | Integer cents, one price per item in v1 | Size/variant pricing from day one |
+| 5 | Login method | **Open.** Proposed: email and password, invite-only, sign-up disabled | Passwordless email links or codes |
+| 6 | Pricing | Integer cents, one price per item in v1. Sizes can be added later as a new table without reworking existing data | Size/variant pricing from day one |
 | 7 | Test tooling | Supabase CLI local stack (Docker) + pgTAP + Playwright | Test against a hosted dev project; Vitest only |

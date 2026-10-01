@@ -48,7 +48,7 @@ The platform has two sides:
 
 ## 4. Current scope
 
-**Milestone 0 (now):** project scaffold, repository structure and documentation only. There are no application features, database tables or Supabase integration yet.
+**Done so far (Milestones 0–1):** project scaffold, documentation, and the database: schema, security rules, sample data and tenant-isolation tests, running locally. There are no user-facing features yet.
 
 **First release (MVP),** Milestones 1–8 in [ROADMAP.md](./ROADMAP.md):
 - Database schema with Row Level Security and automated tenant-isolation tests

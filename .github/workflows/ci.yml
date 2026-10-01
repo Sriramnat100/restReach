@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    name: Lint and typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+
+  database:
+    name: Database tests (RLS and tenant isolation)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Starts Postgres with every migration and the seed data applied.
+      # The dashboard and mail catcher aren't needed for tests.
+      - name: Start local Supabase
+        run: npx supabase start --exclude studio,mailpit
+      - name: Run database tests
+        run: npm run db:test
+      - name: Check generated database types are up to date
+        run: |
+          npm run db:types
+          git diff --exit-code lib/db/database.types.ts
